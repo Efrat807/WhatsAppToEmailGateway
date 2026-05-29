@@ -8,6 +8,10 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "nodemailer": "^6.9.9"
+    "googleapis": "^173.0.0",
+    "imap": "^0.8.19",
+    "mailparser": "^3.9.8",
+    "nodemailer": "^6.9.9",
+    "twilio": "^6.0.2"
   }
 }
