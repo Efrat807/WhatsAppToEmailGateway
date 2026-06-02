@@ -1,30 +1,37 @@
 const express = require('express');
 const nodemailer = require('nodemailer');
-const { google } = require('googleapis');
-
+const Imap = require('imap');
+const { simpleParser } = require('mailparser');
+ 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
-
-// --- משתני סביבה ---
+ 
 const {
   GMAIL_USER,
   GMAIL_APP_PASSWORD,
   MY_EMAIL,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
-  TWILIO_WHATSAPP_FROM,  // למשל: whatsapp:+14155238886
+  TWILIO_WHATSAPP_FROM,
 } = process.env;
-
-// --- Nodemailer לשליחת מייל ---
+ 
+// --- בדיקת משתני סביבה ---
+console.log('🔧 בדיקת הגדרות:');
+console.log('  GMAIL_USER:', GMAIL_USER ? '✅' : '❌ חסר');
+console.log('  GMAIL_APP_PASSWORD:', GMAIL_APP_PASSWORD ? '✅' : '❌ חסר');
+console.log('  MY_EMAIL:', MY_EMAIL ? '✅' : '❌ חסר');
+console.log('  TWILIO_ACCOUNT_SID:', TWILIO_ACCOUNT_SID ? '✅' : '❌ חסר');
+console.log('  TWILIO_AUTH_TOKEN:', TWILIO_AUTH_TOKEN ? '✅' : '❌ חסר');
+console.log('  TWILIO_WHATSAPP_FROM:', TWILIO_WHATSAPP_FROM || '❌ חסר');
+ 
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
 });
-
-// --- Twilio לשליחת WhatsApp ---
+ 
 const twilio = require('twilio')(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-
+ 
 // =====================================================
 // 1. WEBHOOK – WhatsApp נכנס → מייל
 // =====================================================
@@ -33,10 +40,11 @@ app.post('/webhook', async (req, res) => {
     const from        = req.body.From || 'לא ידוע';
     const body        = req.body.Body || '';
     const profileName = req.body.ProfileName || '';
-
+ 
     console.log(`📩 הודעה נכנסת מ-${from}: ${body}`);
-
-    await transporter.sendMail({
+    console.log(`📧 שולח מייל ל-${MY_EMAIL}...`);
+ 
+    const result = await transporter.sendMail({
       from: `"WhatsApp Gateway" <${GMAIL_USER}>`,
       to: MY_EMAIL,
       subject: `💬 הודעה חדשה מ-${profileName || from.replace('whatsapp:', '')}`,
@@ -57,26 +65,40 @@ app.post('/webhook', async (req, res) => {
         </div>
       `,
     });
-
-    console.log('✅ מייל נשלח');
+ 
+    console.log('✅ מייל נשלח! messageId:', result.messageId);
     res.set('Content-Type', 'text/xml');
     res.send('<Response></Response>');
   } catch (err) {
-    console.error('❌ שגיאה ב-webhook:', err.message);
+    console.error('❌ שגיאה בשליחת מייל:', err.message);
+    console.error('❌ פרטי שגיאה:', JSON.stringify(err, null, 2));
     res.status(500).send('Error');
   }
 });
-
+ 
 // =====================================================
 // 2. GMAIL POLLER – מייל יוצא → WhatsApp
-//    פורמט נושא: WA:0501234567: תיאור כלשהו
-//    גוף המייל = ההודעה לשליחה
+//    פורמט נושא: WA:0501234567 או WA:0501234567: טקסט
 // =====================================================
-
-// אימות Gmail עם App Password דרך IMAP (imap library)
-const Imap = require('imap');
-const { simpleParser } = require('mailparser');
-
+async function sendWhatsApp(to, message) {
+  let normalized = to.replace(/\D/g, '');
+  if (normalized.startsWith('0')) {
+    normalized = '972' + normalized.slice(1);
+  }
+  const whatsappTo = `whatsapp:+${normalized}`;
+  console.log(`📤 שולח WhatsApp ל-${whatsappTo}`);
+  console.log(`📝 תוכן: ${message.substring(0, 100)}`);
+ 
+  const result = await twilio.messages.create({
+    from: TWILIO_WHATSAPP_FROM,
+    to: whatsappTo,
+    body: message,
+  });
+ 
+  console.log('✅ WhatsApp נשלח! SID:', result.sid, 'Status:', result.status);
+  return result;
+}
+ 
 function startGmailPoller() {
   const imap = new Imap({
     user: GMAIL_USER,
@@ -86,107 +108,93 @@ function startGmailPoller() {
     tls: true,
     tlsOptions: { rejectUnauthorized: false },
   });
-
-  function openInbox(cb) {
-    imap.openBox('INBOX', false, cb);
-  }
-
-  async function sendWhatsApp(to, message) {
-    // נרמול מספר: מוריד 0 מהתחלה ומוסיף +972 אם ישראלי
-    let normalized = to.replace(/\D/g, '');
-    if (normalized.startsWith('0')) {
-      normalized = '972' + normalized.slice(1);
-    }
-    const whatsappTo = `whatsapp:+${normalized}`;
-
-    console.log(`📤 שולח WhatsApp ל-${whatsappTo}: ${message}`);
-
-    await twilio.messages.create({
-      from: TWILIO_WHATSAPP_FROM,
-      to: whatsappTo,
-      body: message,
-    });
-
-    console.log('✅ WhatsApp נשלח!');
-  }
-
+ 
   function checkNewMails() {
-    openInbox((err) => {
-      if (err) { console.error('IMAP inbox error:', err); return; }
-
-      // חיפוש מיילים שלא נקראו עם WA: בנושא
+    imap.openBox('INBOX', false, (err) => {
+      if (err) { console.error('IMAP openBox error:', err.message); return; }
+ 
       imap.search(['UNSEEN', ['SUBJECT', 'WA:']], (err, results) => {
-        if (err || !results || results.length === 0) return;
-
+        if (err) { console.error('IMAP search error:', err.message); return; }
+        if (!results || results.length === 0) return;
+ 
         console.log(`📬 נמצאו ${results.length} מיילים לשליחה`);
-
+ 
         const fetch = imap.fetch(results, { bodies: '' });
-
+ 
         fetch.on('message', (msg) => {
           msg.on('body', (stream) => {
             simpleParser(stream, async (err, parsed) => {
-              if (err) { console.error('Parse error:', err); return; }
-
+              if (err) { console.error('Parse error:', err.message); return; }
+ 
               const subject = parsed.subject || '';
-              // חילוץ מספר מהנושא: WA:0501234567:
-              const match = subject.match(/WA:(\+?[\d]+):/i);
-              if (!match) return;
-
-              const phoneNumber = match[1];
-              const messageBody = parsed.text?.trim() || parsed.html?.replace(/<[^>]+>/g, '').trim() || '';
-
-              if (!messageBody) {
-                console.log('⚠️ גוף מייל ריק, מדלג');
+              console.log(`📋 נושא: "${subject}"`);
+ 
+              // תואם: WA:0501234567 או WA:0501234567: או WA:0501234567: טקסט
+              const match = subject.match(/WA:(\+?[\d]+):?/i);
+              if (!match) {
+                console.log('⚠️ לא נמצא מספר בנושא');
                 return;
               }
-
+ 
+              const phoneNumber = match[1];
+              console.log(`📱 מספר: ${phoneNumber}`);
+ 
+              const messageBody = parsed.text?.trim() || 
+                parsed.html?.replace(/<[^>]+>/g, '').trim() || '';
+ 
+              if (!messageBody) {
+                console.log('⚠️ גוף מייל ריק');
+                return;
+              }
+ 
               try {
                 await sendWhatsApp(phoneNumber, messageBody);
               } catch (e) {
                 console.error('❌ שגיאה בשליחת WhatsApp:', e.message);
+                if (e.code) console.error('❌ קוד שגיאה:', e.code);
+                if (e.status) console.error('❌ HTTP status:', e.status);
               }
             });
           });
         });
-
-        // סמן כנקרא אחרי עיבוד
+ 
         fetch.once('end', () => {
           imap.setFlags(results, ['\\Seen'], (err) => {
-            if (err) console.error('Flag error:', err);
+            if (err) console.error('Flag error:', err.message);
+            else console.log('✅ מיילים סומנו כנקראו');
           });
         });
       });
     });
   }
-
+ 
   imap.once('ready', () => {
     console.log('📧 Gmail IMAP מחובר – מאזין למיילים חדשים');
     checkNewMails();
-    // בדיקה כל 30 שניות
     setInterval(checkNewMails, 30000);
   });
-
+ 
   imap.once('error', (err) => {
-    console.error('IMAP error:', err.message);
-    setTimeout(startGmailPoller, 10000); // נסה שוב אחרי 10 שניות
+    console.error('IMAP connection error:', err.message);
+    setTimeout(startGmailPoller, 10000);
   });
-
+ 
   imap.connect();
 }
-
+ 
 // =====================================================
-// 3. בדיקת תקינות + הפעלה
+// 3. בדיקת תקינות
 // =====================================================
 app.get('/', (req, res) => {
   res.send(`
     <div dir="rtl" style="font-family:Arial;padding:30px">
       <h2>✅ WhatsApp ↔ Gmail Gateway פועל!</h2>
       <p>📩 <strong>קבלת הודעות:</strong> WhatsApp → Gmail אוטומטי</p>
-      <p>📤 <strong>שליחת הודעות:</strong> שלח מייל עם נושא: <code>WA:0501234567: תיאור</code></p>
+      <p>📤 <strong>שליחת הודעות:</strong> שלח מייל עם נושא: <code>WA:0501234567</code></p>
     </div>
   `);
 });
-
+ 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 שרת פועל על פורט ${PORT}`);
